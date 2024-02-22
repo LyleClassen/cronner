@@ -27,7 +27,6 @@
     "@nestjs/schedule": "^4.0.1",
     "axios": "^1.6.7",
     "date-fns": "^3.3.1",
-    "dotenv": "^16.4.5",
     "reflect-metadata": "^0.2.0",
     "rxjs": "^7.8.1",
     "tuya-cloud-api": "^2.0.0"

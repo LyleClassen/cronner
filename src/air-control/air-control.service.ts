@@ -1,8 +1,35 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import axios from 'axios';
-import { differenceInMinutes, format, isAfter } from 'date-fns';
+import {
+  differenceInMinutes,
+  format,
+  isAfter,
+  isBefore,
+  parse,
+  parseISO,
+} from 'date-fns';
 import { tuyaApi } from 'tuya-cloud-api';
+
+type AreaInfo = {
+  events: {
+    end: string;
+    note: string;
+    start: string;
+  }[];
+  info: {
+    name: string;
+    region: string;
+  };
+  schedule: {
+    days: {
+      date: string;
+      name: string;
+      stages: string[][];
+    }[];
+    source: string;
+  };
+};
 
 @Injectable()
 export class AirControlService {
@@ -15,8 +42,7 @@ export class AirControlService {
   esp_licence_key = process.env.ESP_LICENCE_KEY;
   esp_area_id = process.env.ESP_AREA_ID;
 
-  todaySchedule: any = {};
-  currentStage = 0;
+  nextLoadSheddingTime: Date;
   constructor() {
     this.logger.debug('TUYA_ID:', this.client_id);
     this.logger.debug('TUYA_SECRET:', this.secret);
@@ -25,13 +51,12 @@ export class AirControlService {
     this.logger.debug('ESP_AREA_ID:', this.esp_area_id);
 
     this.loadsheddingScheduleUpdate();
-    this.loadsheddingStageUpdate();
   }
 
-  @Cron(CronExpression.EVERY_6_HOURS)
+  @Cron(CronExpression.EVERY_3_HOURS)
   async loadsheddingScheduleUpdate() {
     try {
-      const areaInfo = await axios.get(
+      const { data } = await axios.get(
         'https://developer.sepush.co.za/business/2.0/area',
         {
           params: {
@@ -43,13 +68,8 @@ export class AirControlService {
         },
       );
 
-      const {
-        schedule: { days },
-      } = areaInfo.data;
-
-      this.todaySchedule = days[0];
-
-      this.logger.log('Today Schedule: ', days[0]);
+      this.nextLoadSheddingTime = this.nextLoadShedding(data, new Date());
+      this.logger.log('NEXT LOADSHEDDING:', this.nextLoadSheddingTime);
     } catch (error) {
       this.logger.error(
         'Something went wrong fetching ESP Schedule data!',
@@ -58,50 +78,34 @@ export class AirControlService {
     }
   }
 
-  @Cron(CronExpression.EVERY_HOUR)
-  async loadsheddingStageUpdate() {
-    try {
-      const areaInfo = await axios.get(
-        'https://developer.sepush.co.za/business/2.0/status',
-        {
-          headers: {
-            token: this.esp_licence_key,
-          },
-        },
-      );
-
-      const {
-        status: { capetown },
-      } = areaInfo.data;
-
-      this.currentStage = parseInt(capetown.stage);
-      this.logger.log('Current Stage: ', capetown.stage);
-    } catch (error) {
-      this.logger.error('Something went wrong fetching ESP Stage data!', error);
-    }
-  }
-
-  @Cron(CronExpression.EVERY_30_MINUTES)
+  @Cron(CronExpression.EVERY_5_MINUTES)
   async handleAircon() {
-    await tuyaApi.authorize({
-      apiClientId: this.client_id,
-      apiClientSecret: this.secret,
-      serverLocation: 'eu',
-    });
+    try {
+      await tuyaApi.authorize({
+        apiClientId: this.client_id,
+        apiClientSecret: this.secret,
+        serverLocation: 'eu',
+      });
 
-    const airconOn = await this.isAirconOn();
-    this.logger.log('Aircon is on: ', airconOn);
-    if (airconOn && this.currentStage > 0) {
-      const currentStageTimes =
-        this.todaySchedule.stages[this.currentStage + 1];
-      this.logger.log('Current Stage Times', currentStageTimes);
-
-      const offTime = this.findUpcomingTimeWithin30Mins(currentStageTimes);
-
-      if (offTime) {
-        this.logger.log('Setting Timer for:', offTime);
-        this.startTimer(offTime);
+      const airconOn = await this.isAirconOn();
+      this.logger.log('Aircon is on: ', airconOn);
+      if (airconOn && this.nextLoadSheddingTime) {
+        const minDiff = differenceInMinutes(
+          this.nextLoadSheddingTime,
+          new Date(),
+        );
+        this.logger.debug('Loadshedding at: ', this.nextLoadSheddingTime);
+        this.logger.debug('Minutes Til Power off:', minDiff);
+        if (minDiff <= 5) {
+          this.logger.log('Turning Aircon Off');
+          tuyaApi.sendCommand({
+            deviceId: this.aircon_id,
+            commands: [{ code: 'switch', value: false }],
+          });
+        }
       }
+    } catch (error) {
+      this.logger.error('Aircon Check Failed:', error);
     }
   }
 
@@ -112,19 +116,6 @@ export class AirControlService {
 
     return airconDetails.find((details) => details.code === 'switch').value;
   }
-
-  // Utility function to create a Date object from a time string for today
-  createTime = (time: string): Date => {
-    const [hours, minutes] = time.split(':').map(Number);
-    const now = new Date();
-    return new Date(
-      now.getFullYear(),
-      now.getMonth(),
-      now.getDate(),
-      hours,
-      minutes,
-    );
-  };
 
   startTimer = (startTime: Date) => {
     const now = new Date();
@@ -139,25 +130,97 @@ export class AirControlService {
     }, delay);
   };
 
-  // Function to find the upcoming time range
-  findUpcomingTimeWithin30Mins = (timeRanges: string[]): Date | null => {
-    const now = new Date();
+  findUpcomingStartTimeAsString(
+    timeRanges: string[],
+    currentTime: Date,
+  ): string {
+    const today = format(currentTime, 'yyyy-MM-dd');
+    let upcomingStartTime: string | null = null;
 
     for (const range of timeRanges) {
-      const [startTimeStr] = range.split('-');
-      const startTime = this.createTime(startTimeStr);
+      const [startTime] = range.split('-');
 
-      if (isAfter(startTime, now)) {
-        // Check if difference is 30 minutes or less
-        const diff = differenceInMinutes(startTime, now);
-        if (diff <= 30) {
-          // Return the start time in HH:mm format if within 30 minutes
-          return startTime;
-        }
-        break; // Exit loop since we found the next upcoming time but it's more than 30 mins away
+      // Construct a full date-time string for comparison
+      const fullStartTimeString = `${today} ${startTime}`;
+      const startTimeDate = parse(
+        fullStartTimeString,
+        'yyyy-MM-dd HH:mm',
+        new Date(),
+      );
+
+      if (isAfter(startTimeDate, currentTime)) {
+        upcomingStartTime = startTime;
+        break;
       }
     }
 
-    return null; // No upcoming time within 30 minutes found
-  };
+    // If no future start time found for today, take the first start time for the next day
+    if (!upcomingStartTime) {
+      upcomingStartTime = timeRanges[0].split('-')[0];
+    }
+
+    return upcomingStartTime;
+  }
+
+  nextLoadShedding(areaInfo: AreaInfo, currentTime: Date) {
+    const currentEvent = areaInfo.events[0];
+
+    const stage = parseInt(currentEvent.note.match(/\d+/)?.[0] ?? '0');
+    const eventStart = parseISO(currentEvent.start);
+    const eventEnd = parseISO(currentEvent.end);
+    console.log('Stage:', stage);
+
+    console.log('eStr', eventStart);
+    console.log('eend', eventEnd);
+
+    const isCurrentlyLoadshedding =
+      isAfter(currentTime, eventStart) && isBefore(currentTime, eventEnd);
+
+    console.log('isCurrentlyLoadshedding:', isCurrentlyLoadshedding);
+
+    if (isCurrentlyLoadshedding) {
+      const daySchedule = areaInfo.schedule.days[0];
+
+      console.log('daySchedule', daySchedule);
+
+      const stageSchedule = daySchedule.stages[stage - 1];
+
+      console.log('stageSchedule', stageSchedule);
+
+      const nextTime = this.findUpcomingStartTimeAsString(
+        stageSchedule,
+        currentTime,
+      );
+      console.log('nextTime ', nextTime);
+
+      const nextPossible = parse(
+        `${daySchedule.date} ${nextTime}`,
+        'yyyy-MM-dd HH:mm',
+        new Date(),
+      );
+
+      return isAfter(nextPossible, currentTime) ? nextPossible : undefined;
+    }
+
+    const daySchedule = areaInfo.schedule.days.find(
+      (day) => day.date === format(eventStart, 'yyyy-MM-dd'),
+    );
+
+    console.log('daySchedule', daySchedule);
+
+    const stageSchedule = daySchedule.stages[stage - 1];
+
+    console.log('stageSchedule', stageSchedule);
+
+    const nextTime = this.findUpcomingStartTimeAsString(
+      stageSchedule,
+      currentTime,
+    );
+
+    return parse(
+      `${daySchedule.date} ${nextTime}`,
+      'yyyy-MM-dd HH:mm',
+      new Date(),
+    );
+  }
 }
